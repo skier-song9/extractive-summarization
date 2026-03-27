@@ -1,0 +1,48 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "extractive-summarization"
+version = "0.1.0"
+description = "Hybrid extractive summarization pipeline"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "chardet>=5.2,<6",
+    "datasets>=4.4.0",
+    "fugashi>=1.4.0",
+    "jieba>=0.42.1",
+    "jupyter>=1.1.1",
+    "kiwipiepy>=0.20.4",
+    "networkx>=3.6.1",
+    "nltk>=3.9.3",
+    "notebook>=7.5.5",
+    "peft>=0.17.1",
+    "pyyaml>=6.0.2",
+    "pysbd>=0.3.4",
+    "pytextrank>=3.3.0",
+    "rouge-score>=0.1.2",
+    "scipy>=1.17.1",
+    "sentence-transformers>=5.1.1",
+    "spacy>=3.8.11",
+    "sumy>=0.12.0",
+    "psycopg[binary]>=3.3.3",
+    "python-dotenv>=1.2.2",
+    "unidic-lite>=1.0.8",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4.2",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/summarization", "src/storage"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+markers = [
+    "integration: tests that require external services such as PostgreSQL",
+]

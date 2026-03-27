@@ -1,0 +1,120 @@
+# ============================================================
+#  Hybrid Extractive Summarization — Hyperparameter Config
+# ============================================================
+
+# Text preprocessing
+# 원문을 문장 단위로 나누고, 너무 짧거나 비정상적으로 긴 문장을 제어하는 단계다.
+# 여기서의 sentence segmentation 품질이 이후 LSA/graph/fusion 전체 품질에 직접 영향을 준다.
+preprocessing:
+  # 사용할 문장 분리기
+  # pysbd: 일반적인 rule-based 분리
+  # spacy: spaCy 기반 분리
+  # wtp  : WtP 모델 기반 분리
+  sentence_splitter: "pysbd"
+  # 입력 텍스트의 주 언어 코드
+  # sentence splitter, tokenizer, LSA 언어 처리 등에 함께 사용된다.
+  language: "en"
+  # sentence_splitter=spacy 또는 영어/유럽어 계열 토큰화 시 사용할 spaCy 모델명
+  spacy_model: "en_core_web_sm"
+  # sentence_splitter=wtp 일 때 사용할 모델명
+  wtp_model: "wtp-canine-s-12l"
+  # 너무 짧은 문장을 제거하는 하한
+  min_sentence_tokens: 5
+  # 지나치게 긴 문장을 제한하는 상한
+  max_sentence_tokens: 2048
+
+# Sentence embedding
+# 문장 임베딩은 문장 간 유사도 행렬을 만들고, graph/PageRank 점수 계산의 입력으로 사용된다.
+embedding:
+  # sentence-transformers 호환 임베딩 모델명
+  model_name: "jinaai/jina-embeddings-v5-text-nano-text-matching"
+  # 최종 임베딩 차원 수
+  # 모델 출력이 더 크면 필요 시 잘라서 사용한다.
+  output_dim: 768
+  # cosine 유사도 기반 비교를 위해 임베딩 정규화 적용 여부
+  normalize: true
+  # 임베딩 인코딩 배치 크기
+  # 메모리와 처리량 사이의 trade-off를 조절한다.
+  batch_size: 32
+  # auto / cpu / cuda / mps
+  # auto이면 현재 환경에서 사용 가능한 최적 장치를 선택한다.
+  device: "auto"
+
+# LSA sentence score
+# 문장-용어 행렬에 SVD를 적용해 문장 중요도를 계산한다.
+# 이후 gidf.enabled=true이면 이 점수는 GIDF로 한 번 더 보정된다.
+lsa:
+  # 사용할 latent dimension 수
+  # null이면 내부 규칙에 따라 자동 결정
+  n_components: null
+  # LSA raw score 정규화 방식
+  # minmax: [0, 1] 범위로 스케일
+  # rank  : 순위 기반으로 정규화
+  normalize_method: "minmax"
+
+# Graph/PageRank sentence score
+# 문장 임베딩 유사도 행렬로 그래프를 만든 뒤 PageRank 점수를 계산한다.
+graph:
+  # 두 문장 간 edge를 유지할 최소 유사도
+  # 높을수록 더 강한 연결만 그래프에 남는다.
+  similarity_threshold: 0.20
+  # PageRank damping factor
+  # 보통 0.85 전후를 사용한다.
+  damping: 0.85
+  # PageRank 최대 반복 수
+  max_iter: 100
+  # 수렴 판정 tolerance
+  tol: 1.0e-6
+  # PageRank raw score 정규화 방식
+  normalize_method: "minmax"
+
+# Final score fusion
+# 최종 점수 = alpha * LSA(or GIDF-boosted LSA) + (1 - alpha) * Graph(PageRank)
+fusion:
+  # alpha가 클수록 LSA 쪽 비중이 커지고,
+  # 작을수록 graph/PageRank 비중이 커진다.
+  alpha: 0.6
+
+extraction:
+  # token_budget_ratio, top_k, final_score_threshold 중 하나를 사용
+  # 우선순위: token_budget_ratio > top_k > final_score_threshold
+  # 예: 0.30 -> 선택된 문장들의 토큰 합이 원문의 30% 이하가 되도록 추출
+  token_budget_ratio: 0.30
+  # 예: 3 -> fused score 상위 3개 문장을 추출
+  # null이면 top_k 모드를 비활성화
+  top_k: null
+  # 예: 0.75 -> fused score가 0.75 이상인 문장을 추출
+  # null이면 threshold 모드를 비활성화
+  final_score_threshold: null
+  preserve_order: true
+  redundancy_threshold: 0.95
+
+parallel:
+  n_workers: -1
+  embedding_chunk_size: 10
+
+logging:
+  level: "INFO"
+  log_sentence_scores: false
+
+# Global IDF post-boost
+# LSA 점수 산출 직후, 문장에 포함된 토큰의 전역 IDF 평균으로 LSA 점수를 보정한다.
+# enabled=false이면 기본값 GIDF=1.0으로 간주되어 기존 LSA 동작과 동일하다.
+gidf:
+  # true : DB의 vocab_gidf를 로드해 LSA 점수 보정 적용
+  # false: GIDF 보정 비활성화
+  enabled: false
+  # 사용할 GIDF 버전 ID
+  # null이면 vocab_corpus_version에서 가장 최근 버전을 자동 선택
+  version_id: null
+  # 아래 파라미터들은 새 GIDF 사전을 build_and_store_gidf()로 생성할 때 사용된다.
+  # 온라인 추론 시에는 주로 enabled/version_id가 직접 영향을 준다.
+  # 어휘 포함 기준: 최소 몇 개 문서(text_unit)에 등장해야 하는가
+  min_df: 2
+  # 어휘 제외 기준: 전체 문서 중 너무 자주 등장하는 토큰 제거 비율
+  # 예: 0.85 -> 전체 문서의 85% 이상에 등장하면 제외
+  max_df: 0.85
+  # TF에 1 + log(tf) 스케일 적용 여부
+  sublinear_tf: true
+  # GIDF 사전 구축 시 사용할 언어 코드
+  language_code: "ko"

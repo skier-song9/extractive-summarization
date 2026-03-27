@@ -1,0 +1,49 @@
+# ============================================================
+#  Benchmark Runtime Config
+# ============================================================
+#
+# 이 설정은 벤치마크 실행을 위한 기본값입니다.
+# 기존 summarization.yaml과 동일한 알고리즘을 사용하되,
+# 실행 환경에 맞춰 임베딩 장치를 자동으로 선택합니다.
+
+preprocessing:
+  sentence_splitter: "pysbd"
+  language: "en"
+  spacy_model: "en_core_web_sm"
+  wtp_model: "wtp-canine-s-12l"
+  min_sentence_tokens: 5
+  max_sentence_tokens: 512
+
+embedding:
+  model_name: "jinaai/jina-embeddings-v5-text-nano-text-matching"
+  output_dim: 768
+  normalize: true
+  batch_size: 16
+  device: "auto"
+
+lsa:
+  n_components: null
+  normalize_method: "minmax"
+
+graph:
+  similarity_threshold: 0.20
+  damping: 0.85
+  max_iter: 100
+  tol: 1.0e-6
+  normalize_method: "minmax"
+
+fusion:
+  alpha: 0.5
+
+extraction:
+  token_budget_ratio: 0.30
+  preserve_order: true
+  redundancy_threshold: 0.95
+
+parallel:
+  n_workers: 4
+  embedding_chunk_size: 10
+
+logging:
+  level: "INFO"
+  log_sentence_scores: false
