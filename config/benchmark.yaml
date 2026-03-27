@@ -47,3 +47,11 @@ parallel:
 logging:
   level: "INFO"
   log_sentence_scores: false
+
+gidf:
+  enabled: false
+  version_id: null
+  min_df: 2
+  max_df: 0.85
+  sublinear_tf: true
+  language_code: "en"

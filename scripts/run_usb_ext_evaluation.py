@@ -49,6 +49,16 @@ def parse_args() -> argparse.Namespace:
         help="Directory where the USB EXT report and sentence scores will be written.",
     )
     parser.add_argument(
+        "--gidf-path",
+        default=None,
+        help="Optional path for the temporary USB EXT GIDF artifact JSON.",
+    )
+    parser.add_argument(
+        "--rebuild-gidf",
+        action="store_true",
+        help="Rebuild the USB EXT GIDF artifact even if the JSON already exists.",
+    )
+    parser.add_argument(
         "--force-prepare",
         action="store_true",
         help="Re-download the USB EXT dataset before running the evaluation.",
@@ -59,6 +69,8 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     load_dotenv(PROJECT_ROOT / ".env")
     args = parse_args()
+    output_dir = Path(args.output_dir)
+    gidf_path = Path(args.gidf_path) if args.gidf_path else output_dir / "tmp" / "usb_ext_gidf.json"
 
     report, sentence_scores = run_usb_ext_evaluation(
         config_path=args.config,
@@ -67,14 +79,16 @@ def main() -> None:
         max_samples=args.max_samples,
         force_prepare=args.force_prepare,
         threshold_step=args.threshold_step,
+        gidf_path=gidf_path,
+        rebuild_gidf=args.rebuild_gidf,
     )
 
-    output_dir = Path(args.output_dir)
     report_path = save_usb_ext_report(report, output_dir / "report.json")
     sentence_scores_path = save_usb_ext_sentence_scores(sentence_scores, output_dir / "sentence_scores.jsonl")
 
     paper_metrics = report["paper_comparison_metrics"]
     best_threshold = report["best_threshold_by_f1"]
+    best_auc_threshold = report["best_threshold_by_binary_auc"]
     print(
         "[usb_ext] "
         f"documents={report['run']['documents_evaluated']} "
@@ -82,6 +96,9 @@ def main() -> None:
         f"auc={paper_metrics['auc']:.4f} "
         f"best_threshold={best_threshold['threshold']:.4f} "
         f"best_f1={best_threshold['f1']:.4f} "
+        f"best_auc_threshold={best_auc_threshold['threshold']:.4f} "
+        f"best_binary_auc={best_auc_threshold['binary_auc']:.4f} "
+        f"gidf={report['gidf']['artifact_path']} "
         f"report={report_path} "
         f"sentence_scores={sentence_scores_path}"
     )

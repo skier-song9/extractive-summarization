@@ -9,13 +9,14 @@ from typing import Any
 import numpy as np
 from sklearn import metrics
 
-from ..config import SummarizationConfig
+from ..config import GIDFConfig, SummarizationConfig
 from ..embedder import compute_similarity_matrix, embed_sentences
 from ..fusion import fuse_scores
 from ..graph_ranker import compute_pagerank_scores
-from ..lsa_scorer import compute_lsa_scores
+from ..lsa_scorer import apply_gidf_boost, compute_lsa_scores
 from ..utils import get_logger
-from .datasets import get_dataset_spec, iter_raw_rows, prepare_dataset
+from ..vocab_builder import _compute_gidf
+from .datasets import USB_EXT_SPLITS, dataset_dir, get_dataset_spec, iter_raw_rows, prepare_dataset
 
 
 @dataclass(slots=True)
@@ -27,6 +28,7 @@ class USBExtSentenceScore:
     sentence: str
     label: int
     lsa_score: float
+    gidf_lsa_score: float
     pagerank_score: float
     final_score: float
 
@@ -40,11 +42,16 @@ def run_usb_ext_evaluation(
     force_prepare: bool = False,
     threshold_step: float = 0.01,
     preview_examples: int = 3,
+    gidf_path: str | Path | None = None,
+    rebuild_gidf: bool = False,
+    gidf_splits: tuple[str, ...] = USB_EXT_SPLITS,
 ) -> tuple[dict[str, Any], list[USBExtSentenceScore]]:
     if max_samples is not None and max_samples <= 0:
         raise ValueError("max_samples must be positive when provided")
     if not 0.0 < threshold_step <= 1.0:
         raise ValueError("threshold_step must be within the range (0.0, 1.0].")
+    if not gidf_splits:
+        raise ValueError("gidf_splits must contain at least one USB EXT split.")
 
     dataset_name = "usb_ext"
     spec = get_dataset_spec(dataset_name)
@@ -57,6 +64,14 @@ def run_usb_ext_evaluation(
         force=force_prepare,
     )
     cfg = SummarizationConfig.from_yaml(config_path)
+    gidf_scores, gidf_metadata = _prepare_usb_ext_gidf(
+        cfg=cfg,
+        data_dir=data_dir,
+        gidf_path=gidf_path,
+        rebuild=rebuild_gidf,
+        splits=gidf_splits,
+        logger=logger,
+    )
 
     started_at = time.perf_counter()
     sentence_scores: list[USBExtSentenceScore] = []
@@ -65,7 +80,7 @@ def run_usb_ext_evaluation(
 
     for row in iter_raw_rows(dataset_name, data_dir=data_dir, split=resolved_split):
         document_count += 1
-        document_scores = _score_usb_ext_row(row, cfg, split=resolved_split)
+        document_scores = _score_usb_ext_row(row, cfg, split=resolved_split, gidf=gidf_scores)
         if not document_scores:
             continue
         sentence_scores.extend(document_scores)
@@ -89,6 +104,7 @@ def run_usb_ext_evaluation(
         max_samples=max_samples,
         elapsed_seconds=elapsed_seconds,
         preview_documents=preview_documents,
+        gidf_metadata=gidf_metadata,
     )
     return report, sentence_scores
 
@@ -117,6 +133,7 @@ def _score_usb_ext_row(
     cfg: SummarizationConfig,
     *,
     split: str,
+    gidf: dict[str, float],
 ) -> list[USBExtSentenceScore]:
     raw_sentences = row.get("input_lines")
     if not isinstance(raw_sentences, list) or not raw_sentences:
@@ -124,7 +141,11 @@ def _score_usb_ext_row(
 
     sentences = [_normalize_usb_sentence(sentence) for sentence in raw_sentences]
     labels = _normalize_usb_labels(row.get("labels"), len(sentences))
-    lsa_scores, pagerank_scores, final_scores = _compute_usb_sentence_scores(sentences, cfg)
+    lsa_scores, gidf_lsa_scores, pagerank_scores, final_scores = _compute_usb_sentence_scores(
+        sentences,
+        cfg,
+        gidf,
+    )
 
     example_id_raw = row.get("id")
     example_id = str(example_id_raw) if example_id_raw not in {None, ""} else f"{split}:{hash(tuple(sentences))}"
@@ -139,6 +160,7 @@ def _score_usb_ext_row(
             sentence=sentence,
             label=labels[index],
             lsa_score=float(lsa_scores.get(index, 0.0)),
+            gidf_lsa_score=float(gidf_lsa_scores.get(index, 0.0)),
             pagerank_score=float(pagerank_scores.get(index, 0.0)),
             final_score=float(final_scores.get(index, 0.0)),
         )
@@ -149,21 +171,31 @@ def _score_usb_ext_row(
 def _compute_usb_sentence_scores(
     sentences: list[str],
     cfg: SummarizationConfig,
-) -> tuple[dict[int, float], dict[int, float], dict[int, float]]:
+    gidf: dict[str, float],
+) -> tuple[dict[int, float], dict[int, float], dict[int, float], dict[int, float]]:
     if not sentences:
-        return {}, {}, {}
+        return {}, {}, {}, {}
 
     embeddings = embed_sentences(sentences, cfg.embedding)
     sim_matrix = compute_similarity_matrix(embeddings)
     lsa_scores = compute_lsa_scores(
         sentences,
         cfg.lsa,
-        cfg.embedding,
         cfg.preprocessing.language,
+        cfg.preprocessing.spacy_model,
+        cfg.embedding,
+    )
+    gidf_lsa_scores = apply_gidf_boost(
+        lsa_scores,
+        sentences,
+        gidf,
+        language=cfg.preprocessing.language,
+        spacy_model=cfg.preprocessing.spacy_model,
+        embedding_cfg=cfg.embedding,
     )
     pagerank_scores = compute_pagerank_scores(sim_matrix, cfg.graph)
-    final_scores = fuse_scores(lsa_scores, pagerank_scores, cfg.fusion)
-    return lsa_scores, pagerank_scores, final_scores
+    final_scores = fuse_scores(gidf_lsa_scores, pagerank_scores, cfg.fusion)
+    return lsa_scores, gidf_lsa_scores, pagerank_scores, final_scores
 
 
 def _normalize_usb_sentence(value: Any) -> str:
@@ -187,6 +219,152 @@ def _infer_domain(example_id: str) -> str:
     return prefix
 
 
+def _prepare_usb_ext_gidf(
+    *,
+    cfg: SummarizationConfig,
+    data_dir: str | Path,
+    gidf_path: str | Path | None,
+    rebuild: bool,
+    splits: tuple[str, ...],
+    logger,
+) -> tuple[dict[str, float], dict[str, Any]]:
+    resolved_path = _resolve_usb_ext_gidf_path(data_dir, gidf_path)
+    if resolved_path.exists() and not rebuild:
+        gidf_scores, metadata = _load_usb_ext_gidf_artifact(resolved_path)
+        logger.info(
+            "Loaded USB EXT GIDF artifact from %s (%d terms)",
+            resolved_path,
+            metadata["term_count"],
+        )
+        return gidf_scores, metadata
+
+    gidf_scores, metadata = _build_usb_ext_gidf_artifact(
+        cfg=cfg,
+        data_dir=data_dir,
+        output_path=resolved_path,
+        splits=splits,
+    )
+    logger.info(
+        "Built USB EXT GIDF artifact from splits=%s -> %s (%d documents, %d terms)",
+        ",".join(splits),
+        resolved_path,
+        metadata["document_count"],
+        metadata["term_count"],
+    )
+    return gidf_scores, metadata
+
+
+def _resolve_usb_ext_gidf_path(data_dir: str | Path, gidf_path: str | Path | None) -> Path:
+    if gidf_path is not None:
+        return Path(gidf_path)
+    return dataset_dir(data_dir, "usb_ext") / "tmp" / "usb_ext_gidf.json"
+
+
+def _build_usb_ext_gidf_artifact(
+    *,
+    cfg: SummarizationConfig,
+    data_dir: str | Path,
+    output_path: str | Path,
+    splits: tuple[str, ...],
+) -> tuple[dict[str, float], dict[str, Any]]:
+    documents = _collect_usb_ext_documents(data_dir=data_dir, splits=splits)
+    gidf_cfg = _build_usb_ext_config_gidf(cfg)
+    terms, gidf_scores, doc_frequency = _compute_gidf(documents, gidf_cfg)
+    spec = get_dataset_spec("usb_ext")
+    rows = [
+        [str(term), float(score), int(doc_freq)]
+        for term, score, doc_freq in zip(terms, gidf_scores, doc_frequency, strict=True)
+    ]
+
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "dataset": {
+            "name": "usb_ext",
+            "source_id": spec.source_id,
+            "config": spec.config,
+            "splits": list(splits),
+        },
+        "gidf_config": {
+            "language_code": gidf_cfg.language_code,
+            "min_df": gidf_cfg.min_df,
+            "max_df": gidf_cfg.max_df,
+            "sublinear_tf": gidf_cfg.sublinear_tf,
+        },
+        "document_count": len(documents),
+        "term_count": len(rows),
+        "rows": rows,
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    return (
+        {term: score for term, score, _ in rows},
+        {
+            "artifact_path": str(path),
+            "source_splits": list(splits),
+            "document_count": len(documents),
+            "term_count": len(rows),
+            "language_code": gidf_cfg.language_code,
+            "min_df": gidf_cfg.min_df,
+            "max_df": gidf_cfg.max_df,
+            "sublinear_tf": gidf_cfg.sublinear_tf,
+        },
+    )
+
+
+def _load_usb_ext_gidf_artifact(path: str | Path) -> tuple[dict[str, float], dict[str, Any]]:
+    resolved_path = Path(path)
+    payload = json.loads(resolved_path.read_text(encoding="utf-8"))
+    rows = payload.get("rows", [])
+    gidf_scores = {str(term): float(score) for term, score, *_ in rows}
+    return gidf_scores, {
+        "artifact_path": str(resolved_path),
+        "source_splits": list(payload.get("dataset", {}).get("splits", [])),
+        "document_count": int(payload.get("document_count", 0)),
+        "term_count": int(payload.get("term_count", len(gidf_scores))),
+        "language_code": str(payload.get("gidf_config", {}).get("language_code", "")),
+        "min_df": int(payload.get("gidf_config", {}).get("min_df", 0)),
+        "max_df": float(payload.get("gidf_config", {}).get("max_df", 0.0)),
+        "sublinear_tf": bool(payload.get("gidf_config", {}).get("sublinear_tf", False)),
+    }
+
+
+def _collect_usb_ext_documents(
+    *,
+    data_dir: str | Path,
+    splits: tuple[str, ...],
+) -> list[str]:
+    documents: list[str] = []
+    for split in splits:
+        for row in iter_raw_rows("usb_ext", data_dir=data_dir, split=split):
+            raw_sentences = row.get("input_lines")
+            if not isinstance(raw_sentences, list) or not raw_sentences:
+                continue
+
+            normalized_sentences: list[str] = []
+            for sentence in raw_sentences:
+                normalized_sentence = _normalize_usb_sentence(sentence)
+                if normalized_sentence:
+                    normalized_sentences.append(normalized_sentence)
+            if normalized_sentences:
+                documents.append(" ".join(normalized_sentences))
+
+    if not documents:
+        raise ValueError("USB EXT GIDF build produced no usable documents.")
+    return documents
+
+
+def _build_usb_ext_config_gidf(cfg: SummarizationConfig) -> GIDFConfig:
+    return GIDFConfig(
+        enabled=True,
+        version_id=None,
+        min_df=cfg.gidf.min_df,
+        max_df=cfg.gidf.max_df,
+        sublinear_tf=cfg.gidf.sublinear_tf,
+        language_code=cfg.preprocessing.language,
+    )
+
+
 def _build_usb_ext_report(
     *,
     sentence_scores: list[USBExtSentenceScore],
@@ -197,6 +375,7 @@ def _build_usb_ext_report(
     max_samples: int | None,
     elapsed_seconds: float,
     preview_documents: list[dict[str, Any]],
+    gidf_metadata: dict[str, Any],
 ) -> dict[str, Any]:
     labels = np.asarray([record.label for record in sentence_scores], dtype=np.int32)
     scores = np.asarray([record.final_score for record in sentence_scores], dtype=np.float64)
@@ -205,6 +384,7 @@ def _build_usb_ext_report(
     threshold_grid = _build_threshold_grid(threshold_step)
     threshold_sweep = [_threshold_metrics(labels, scores, threshold) for threshold in threshold_grid]
     best_threshold = _best_threshold_by_f1(labels, scores)
+    best_threshold_by_binary_auc = _best_threshold_by_binary_auc(threshold_sweep)
     rounded_metrics = _rounded_metrics(labels, scores)
     continuous_auc = _safe_roc_auc(labels, scores)
 
@@ -220,6 +400,9 @@ def _build_usb_ext_report(
             "auc": _safe_roc_auc(domain_labels, domain_scores),
             "default_round_metrics": _rounded_metrics(domain_labels, domain_scores),
             "best_threshold_by_f1": _best_threshold_by_f1(domain_labels, domain_scores),
+            "best_threshold_by_binary_auc": _best_threshold_by_binary_auc(
+                [_threshold_metrics(domain_labels, domain_scores, threshold) for threshold in threshold_grid]
+            ),
         }
 
     return {
@@ -240,6 +423,7 @@ def _build_usb_ext_report(
             ),
             "sentences_per_second": len(sentence_scores) / elapsed_seconds if elapsed_seconds > 0 else 0.0,
         },
+        "gidf": gidf_metadata,
         "paper_comparison_metrics": {
             "auc": continuous_auc,
             "default_round_metrics": rounded_metrics,
@@ -249,6 +433,7 @@ def _build_usb_ext_report(
             ),
         },
         "best_threshold_by_f1": best_threshold,
+        "best_threshold_by_binary_auc": best_threshold_by_binary_auc,
         "threshold_sweep_step": threshold_step,
         "threshold_sweep": threshold_sweep,
         "score_distribution": {
@@ -303,6 +488,24 @@ def _best_threshold_by_f1(labels: np.ndarray, scores: np.ndarray) -> dict[str, f
     best = _threshold_metrics(labels, scores, float(thresholds[best_index]))
     best["search_candidate_count"] = int(len(thresholds))
     return best
+
+
+def _best_threshold_by_binary_auc(threshold_sweep: list[dict[str, float]]) -> dict[str, float]:
+    if not threshold_sweep:
+        raise ValueError("threshold_sweep must not be empty.")
+
+    best = max(
+        threshold_sweep,
+        key=lambda item: (
+            float(item["binary_auc"]) if item["binary_auc"] is not None else float("-inf"),
+            float(item["f1"]),
+            float(item["accuracy"]),
+            -float(item["threshold"]),
+        ),
+    )
+    result = dict(best)
+    result["search_candidate_count"] = int(len(threshold_sweep))
+    return result
 
 
 def _threshold_metrics(labels: np.ndarray, scores: np.ndarray, threshold: float) -> dict[str, float]:
